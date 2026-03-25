@@ -65,10 +65,48 @@ public class MainMethodCallHandler implements MethodCallHandler {
             result.success(new HashMap<String, Object>());
             break;
         }
+        case "startRecord": {
+            AudioPlayer player = resolvePlayerForPcmRecord(call.argument("id"), result);
+            if (player != null) {
+                player.startPcmRecording((String) call.argument("path"), result);
+            }
+            break;
+        }
+        case "stopRecord": {
+            AudioPlayer player = resolvePlayerForPcmRecord(call.argument("id"), result);
+            if (player != null) {
+                player.stopPcmRecording(result);
+            }
+            break;
+        }
         default:
             result.notImplemented();
             break;
         }
+    }
+
+    /**
+     * If [id] is non-null, that player is used. If null and exactly one player exists, use it
+     * (typical single-player app). Otherwise reports an error.
+     */
+    private AudioPlayer resolvePlayerForPcmRecord(String id, Result result) {
+        if (id != null && !id.isEmpty()) {
+            AudioPlayer player = players.get(id);
+            if (player == null) {
+                result.error("NO_PLAYER", "No player with id: " + id, null);
+                return null;
+            }
+            return player;
+        }
+        if (players.size() == 1) {
+            return players.values().iterator().next();
+        }
+        if (players.isEmpty()) {
+            result.error("NO_PLAYER", "No player; ensure AudioPlayer is created first", null);
+            return null;
+        }
+        result.error("NO_PLAYER", "Multiple players: pass id in startRecord/stopRecord arguments", null);
+        return null;
     }
 
     void dispose() {
