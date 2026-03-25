@@ -116,7 +116,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     private String errorMessage;
     private Integer currentIndex;
     private final Handler handler = new Handler(Looper.getMainLooper());
-    private final AndroidPcmRecorder pcmRecorder = new AndroidPcmRecorder(handler);
+    private final AndroidPcmRecorder pcmRecorder;
     private final Runnable bufferWatcher = new Runnable() {
         @Override
         public void run() {
@@ -156,6 +156,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             Boolean offloadSchedulingEnabled,
             boolean useLazyPreparation) {
         this.context = applicationContext;
+        this.pcmRecorder = new AndroidPcmRecorder(applicationContext, handler);
         this.rawAudioEffects = rawAudioEffects;
         this.offloadSchedulingEnabled = offloadSchedulingEnabled != null ? offloadSchedulingEnabled : false;
         this.useLazyPreparation = useLazyPreparation;
@@ -1117,9 +1118,9 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     }
 
     /** Used from {@link MainMethodCallHandler} for single global method channel. */
-    public void startPcmRecording(String path, Result result) {
+    public void startPcmRecording(String fileName, Result result) {
         ensurePlayerInitialized();
-        pcmRecorder.startRecording(path, result);
+        pcmRecorder.startRecording(fileName, result);
     }
 
     /** Used from {@link MainMethodCallHandler} for single global method channel. */

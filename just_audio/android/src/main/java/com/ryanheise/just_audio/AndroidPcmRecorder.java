@@ -1,10 +1,17 @@
 package com.ryanheise.just_audio;
 
+import android.content.ContentResolver;
+import android.content.ContentValues;
+import android.content.Context;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
+import android.media.MediaScannerConnection;
+import android.net.Uri;
 import android.os.Build;
+import android.os.Environment;
 import android.os.Handler;
+import android.provider.MediaStore;
 import android.util.Log;
 import androidx.media3.common.C;
 import io.flutter.plugin.common.MethodChannel.Result;
@@ -12,9 +19,11 @@ import java.io.BufferedOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -22,22 +31,54 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * TeeAudioProcessor에서 넘어오는 16-bit PCM을 {@link MediaCodec} AAC 인코더로 넣고, raw AAC에
- * ADTS 헤더를 붙여 스트림으로 저장합니다. (예전 MediaCodec + ADTS 방식과 동일한 계열)
+ * ADTS 헤더를 붙여 스트림으로 저장합니다.
  *
  * <p>
- * 파일 확장자는 Flutter에서 넘기는 {@code path} 그대로 사용합니다. 비트스트림은 AAC(ADTS)이며
- * MP3가 아닙니다.
+ * Android 10(Q) 이상: 주 볼륨({@link MediaStore#VOLUME_EXTERNAL_PRIMARY}) 공용 Music
+ * 아래
+ * {@code rainbow_records}에 {@link MediaStore.Audio.Media}로 등록·기록합니다
+ * ({@code IS_PENDING}
+ * 후 완료 시 해제). 완료 후
+ * {@link ContentResolver#notifyChange(Uri, android.database.ContentObserver)}
+ * 로 오디오 앱 인덱싱을 돕습니다. 실제 위치는 API 28 이하의 {@code …/Music/rainbow_records/} 파일 경로와
+ * 같은 공용 트리입니다. Flutter에는 {@code content://} URI 문자열을 돌려줍니다.
+ *
+ * <p>
+ * 그 이하: 동일하게 공용 {@code Music/rainbow_records}에 파일로 저장합니다. 주(Primary) 외부 저장소
+ * 경로는 보통 {@code /storage/emulated/0/Music/rainbow_records/} 형태이며, 파일 관리자의 「내장
+ * 메모리 &gt; Music &gt; rainbow_records」와 같은 위치입니다. 저장 완료 시
+ * {@link MediaScannerConnection#scanFile(Context, String[], String[], MediaScannerConnection.OnScanCompletedListener)}
+ * ({@code audio/mpeg})로 스캔을 요청합니다. 절대 경로를 돌려줍니다. 저장소 권한은 호스트 앱에서
+ * 처리합니다.
+ *
+ * <p>
+ * 비트스트림은 AAC(ADTS)이며, 표시용으로 {@code .mp3} / {@code audio/mp3}를 사용합니다.
  *
  * <p>
  * 오디오 스레드에서는 PCM만 복사하고, 인코딩·쓰기는 단일 스레드 실행기에서 수행합니다.
  */
 final class AndroidPcmRecorder {
     private static final String TAG = "AndroidPcmRecorder";
+    /** {@code adb logcat Record:* *:S} 등으로 저장 경로만 필터할 때 사용 */
+    private static final String RECORD_LOG_TAG = "Record";
     private static final String AAC_MIME = "audio/mp4a-latm";
     /** CBR에 가깝게; 예전 AudioRecorder와 동일 계열 */
     private static final int AAC_BIT_RATE = 96000;
     private static final int DEQUEUE_TIMEOUT_US = 10_000;
 
+    private static final String RECORDS_FOLDER = "rainbow_records";
+
+    /**
+     * MediaStore {@link MediaStore.MediaColumns#RELATIVE_PATH}용. 플랫폼 문서는 {@code /}
+     * 구분을
+     * 사용할 것을 권장합니다 ({@code Music/rainbow_records}).
+     */
+    private static final String RELATIVE_PATH_MUSIC_RAINBOW = Environment.DIRECTORY_MUSIC + "/" + RECORDS_FOLDER;
+
+    /** 미디어 스캔·오디오 앱 인덱싱용 (제안: {@code audio/mpeg}). */
+    private static final String SCAN_MIME_AUDIO_MPEG = "audio/mpeg";
+
+    private final Context appContext;
     private final Handler mainHandler;
     private final ExecutorService writeExecutor = Executors.newSingleThreadExecutor(
             r -> {
@@ -49,7 +90,12 @@ final class AndroidPcmRecorder {
     private final Object lock = new Object();
 
     private volatile boolean recordingDesired;
-    private String outputPath;
+    /** Base name from Flutter (extension optional). */
+    private String recordingFileName;
+    /** Absolute path (legacy) or {@code content://} URI string (Q+). */
+    private String resultPathOrUri;
+    /** Non-null while using MediaStore output on Q+. */
+    private Uri mediaStoreUri;
     private BufferedOutputStream encodedOut;
     private MediaCodec aacEncoder;
     /** Microseconds presentation time for queued PCM. */
@@ -61,7 +107,8 @@ final class AndroidPcmRecorder {
     private int lastChannelCount;
     private @C.PcmEncoding int lastEncoding;
 
-    AndroidPcmRecorder(Handler mainHandler) {
+    AndroidPcmRecorder(Context context, Handler mainHandler) {
+        this.appContext = context.getApplicationContext();
         this.mainHandler = mainHandler;
     }
 
@@ -70,7 +117,7 @@ final class AndroidPcmRecorder {
             lastSampleRateHz = sampleRateHz;
             lastChannelCount = channelCount;
             lastEncoding = encoding;
-            if (recordingDesired && encodedOut == null && outputPath != null) {
+            if (recordingDesired && encodedOut == null && recordingFileName != null) {
                 tryOpenFileForRecordingLocked();
             }
         }
@@ -95,14 +142,14 @@ final class AndroidPcmRecorder {
         writeExecutor.execute(() -> appendPcm(copy));
     }
 
-    void startRecording(String path, Result result) {
+    void startRecording(String fileName, Result result) {
         synchronized (lock) {
             if (recordingDesired) {
                 result.error("ALREADY_RECORDING", "Call stopRecord before startRecord again.", null);
                 return;
             }
-            if (path == null || path.isEmpty()) {
-                result.error("BAD_ARGUMENT", "path is required", null);
+            if (fileName == null || fileName.trim().isEmpty()) {
+                result.error("BAD_ARGUMENT", "fileName is required", null);
                 return;
             }
             if (lastSampleRateHz > 0 && lastEncoding != C.ENCODING_PCM_16BIT) {
@@ -113,7 +160,9 @@ final class AndroidPcmRecorder {
                 return;
             }
             recordingDesired = true;
-            outputPath = path;
+            recordingFileName = fileName.trim();
+            resultPathOrUri = null;
+            mediaStoreUri = null;
             pcmCarry = new byte[0];
             presentationTimeUs = 0;
             if (lastSampleRateHz > 0 && lastEncoding == C.ENCODING_PCM_16BIT) {
@@ -127,12 +176,13 @@ final class AndroidPcmRecorder {
         writeExecutor.execute(
                 () -> {
                     String pathOut = null;
+                    Uri storeUri = null;
                     boolean fileWasOpened = false;
                     IOException ioError = null;
                     synchronized (lock) {
                         recordingDesired = false;
-                        pathOut = outputPath;
-                        outputPath = null;
+                        pathOut = resultPathOrUri;
+                        storeUri = mediaStoreUri;
                         fileWasOpened = encodedOut != null;
                         try {
                             if (aacEncoder != null && encodedOut != null) {
@@ -148,6 +198,53 @@ final class AndroidPcmRecorder {
                         } finally {
                             closeEncoderLocked();
                         }
+                        if (ioError != null) {
+                            if (storeUri != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                try {
+                                    appContext.getContentResolver().delete(storeUri, null, null);
+                                } catch (Exception e) {
+                                    Log.w(TAG, "delete failed MediaStore row", e);
+                                }
+                            } else if (pathOut != null && fileWasOpened) {
+                                try {
+                                    File f = new File(pathOut);
+                                    if (f.exists() && !f.delete()) {
+                                        Log.w(TAG, "Could not delete partial recording: " + pathOut);
+                                    }
+                                } catch (Exception e) {
+                                    Log.w(TAG, "delete partial file", e);
+                                }
+                            }
+                        } else if (storeUri != null
+                                && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+                                && fileWasOpened) {
+                            try {
+                                ContentValues done = new ContentValues();
+                                done.put(MediaStore.Audio.Media.IS_PENDING, 0);
+                                appContext.getContentResolver().update(storeUri, done, null, null);
+                                appContext.getContentResolver().notifyChange(storeUri, null);
+                            } catch (Exception e) {
+                                Log.w(TAG, "clear IS_PENDING / notifyChange", e);
+                            }
+                        }
+                        recordingFileName = null;
+                        resultPathOrUri = null;
+                        mediaStoreUri = null;
+                    }
+                    if (ioError == null
+                            && fileWasOpened
+                            && pathOut != null
+                            && !pathOut.startsWith("content:")) {
+                        MediaScannerConnection.scanFile(
+                                appContext,
+                                new String[] { pathOut },
+                                new String[] { SCAN_MIME_AUDIO_MPEG },
+                                (path, uri) -> Log.i(
+                                        RECORD_LOG_TAG,
+                                        "MediaScanner scanFile: path="
+                                                + path
+                                                + " uri="
+                                                + uri));
                     }
                     final IOException err = ioError;
                     final String out = pathOut;
@@ -158,7 +255,7 @@ final class AndroidPcmRecorder {
                                     result.error("IO_ERROR", err.getMessage(), null);
                                     return;
                                 }
-                                if (out != null && !opened) {
+                                if (!opened) {
                                     result.error(
                                             "NOT_STARTED",
                                             "No PCM was written yet. Start playback after startRecord so audio format is known.",
@@ -175,20 +272,37 @@ final class AndroidPcmRecorder {
     void abort() {
         writeExecutor.execute(
                 () -> {
+                    Uri delUri;
+                    String delLegacyPath;
                     synchronized (lock) {
                         recordingDesired = false;
-                        String path = outputPath;
-                        outputPath = null;
-                        closeEncoderLocked();
-                        if (path != null) {
-                            try {
-                                File f = new File(path);
-                                if (f.exists() && !f.delete()) {
-                                    Log.w(TAG, "Could not delete partial recording: " + path);
-                                }
-                            } catch (Exception e) {
-                                Log.w(TAG, "delete partial", e);
+                        delUri = mediaStoreUri;
+                        delLegacyPath = null;
+                        if (delUri == null && resultPathOrUri != null) {
+                            String p = resultPathOrUri;
+                            if (!p.startsWith("content:")) {
+                                delLegacyPath = p;
                             }
+                        }
+                        recordingFileName = null;
+                        resultPathOrUri = null;
+                        mediaStoreUri = null;
+                        closeEncoderLocked();
+                    }
+                    if (delUri != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        try {
+                            appContext.getContentResolver().delete(delUri, null, null);
+                        } catch (Exception e) {
+                            Log.w(TAG, "abort delete MediaStore", e);
+                        }
+                    } else if (delLegacyPath != null) {
+                        try {
+                            File f = new File(delLegacyPath);
+                            if (f.exists() && !f.delete()) {
+                                Log.w(TAG, "abort could not delete: " + delLegacyPath);
+                            }
+                        } catch (Exception e) {
+                            Log.w(TAG, "abort delete file", e);
                         }
                     }
                 });
@@ -204,7 +318,7 @@ final class AndroidPcmRecorder {
     }
 
     private void tryOpenFileForRecordingLocked() {
-        if (encodedOut != null || outputPath == null) {
+        if (encodedOut != null || recordingFileName == null || recordingFileName.isEmpty()) {
             return;
         }
         if (lastSampleRateHz <= 0 || lastChannelCount <= 0) {
@@ -213,25 +327,109 @@ final class AndroidPcmRecorder {
         if (lastEncoding != C.ENCODING_PCM_16BIT) {
             Log.e(TAG, "Recording requires 16-bit PCM.");
             recordingDesired = false;
-            outputPath = null;
+            recordingFileName = null;
             return;
         }
+        Uri insertedUri = null;
+        String openedLegacyPath = null;
         try {
-            File f = new File(outputPath);
-            File parent = f.getParentFile();
-            if (parent != null && !parent.exists() && !parent.mkdirs()) {
-                throw new IOException("Cannot create directory: " + parent);
+            openRecordingOutputLocked();
+            insertedUri = mediaStoreUri;
+            if (mediaStoreUri == null && resultPathOrUri != null) {
+                openedLegacyPath = resultPathOrUri;
             }
-            encodedOut = new BufferedOutputStream(new FileOutputStream(f), 16384);
             pcmCarry = new byte[0];
             presentationTimeUs = 0;
             aacEncoder = createAndStartAacEncoder();
         } catch (Throwable t) {
             Log.e(TAG, "open encoder", t);
             closeEncoderLocked();
-            outputPath = null;
+            if (insertedUri != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                try {
+                    appContext.getContentResolver().delete(insertedUri, null, null);
+                } catch (Exception e) {
+                    Log.w(TAG, "delete after open failure", e);
+                }
+            } else if (openedLegacyPath != null) {
+                try {
+                    File f = new File(openedLegacyPath);
+                    if (f.exists() && !f.delete()) {
+                        Log.w(TAG, "Could not delete partial file: " + openedLegacyPath);
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "delete partial file", e);
+                }
+            }
+            mediaStoreUri = null;
+            resultPathOrUri = null;
             recordingDesired = false;
+            recordingFileName = null;
         }
+    }
+
+    private void openRecordingOutputLocked() throws IOException {
+        String display = displayNameWithMp3Extension(recordingFileName);
+        ContentResolver cr = appContext.getContentResolver();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.Audio.Media.DISPLAY_NAME, display);
+            values.put(MediaStore.Audio.Media.MIME_TYPE, "audio/mp3");
+            values.put(MediaStore.Audio.Media.RELATIVE_PATH, RELATIVE_PATH_MUSIC_RAINBOW);
+            values.put(MediaStore.Audio.Media.IS_PENDING, 1);
+            Uri uri = cr.insert(MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values);
+            if (uri == null) {
+                throw new IOException("MediaStore insert failed");
+            }
+            OutputStream os = cr.openOutputStream(uri, "w");
+            if (os == null) {
+                cr.delete(uri, null, null);
+                throw new IOException("openOutputStream failed");
+            }
+            encodedOut = new BufferedOutputStream(os, 16384);
+            mediaStoreUri = uri;
+            resultPathOrUri = uri.toString();
+            Log.i(
+                    RECORD_LOG_TAG,
+                    "공용 Music/rainbow_records (primary, MediaStore) uri="
+                            + resultPathOrUri
+                            + " | logical="
+                            + RELATIVE_PATH_MUSIC_RAINBOW
+                            + "/"
+                            + display);
+        } else {
+            File dir = getPublicMusicRainbowRecordsDir();
+            if (!dir.exists() && !dir.mkdirs()) {
+                throw new IOException("Cannot create directory: " + dir.getAbsolutePath());
+            }
+            File outFile = new File(dir, display);
+            encodedOut = new BufferedOutputStream(new FileOutputStream(outFile), 16384);
+            mediaStoreUri = null;
+            resultPathOrUri = outFile.getAbsolutePath();
+            Log.i(
+                    RECORD_LOG_TAG,
+                    "공용 Music/rainbow_records (primary, 파일) path=" + resultPathOrUri);
+        }
+    }
+
+    /**
+     * 주 외부 저장소의 공용 {@link Environment#DIRECTORY_MUSIC} 아래 {@link #RECORDS_FOLDER}.
+     * (일반적으로 파일 관리자의 내장 메모리 &gt; Music &gt; rainbow_records 와 동일.)
+     */
+    private static File getPublicMusicRainbowRecordsDir() {
+        File musicRoot = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC);
+        return new File(musicRoot, RECORDS_FOLDER);
+    }
+
+    private static String displayNameWithMp3Extension(String base) {
+        String b = sanitizeFileName(base);
+        if (b.toLowerCase(Locale.US).endsWith(".mp3")) {
+            return b;
+        }
+        return b + ".mp3";
+    }
+
+    private static String sanitizeFileName(String name) {
+        return name.replaceAll("[\\\\/]", "_").trim();
     }
 
     private MediaCodec createAndStartAacEncoder() throws IOException {

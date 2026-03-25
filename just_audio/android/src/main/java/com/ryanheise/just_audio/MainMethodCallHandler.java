@@ -27,66 +27,65 @@ public class MainMethodCallHandler implements MethodCallHandler {
     @Override
     public void onMethodCall(MethodCall call, @NonNull Result result) {
         switch (call.method) {
-        case "init": {
-            String id = call.argument("id");
-            if (players.containsKey(id)) {
-                result.error("Platform player " + id + " already exists", null, null);
+            case "init": {
+                String id = call.argument("id");
+                if (players.containsKey(id)) {
+                    result.error("Platform player " + id + " already exists", null, null);
+                    break;
+                }
+                List<Object> rawAudioEffects = call.argument("androidAudioEffects");
+                players.put(
+                        id,
+                        new AudioPlayer(
+                                applicationContext,
+                                messenger,
+                                id,
+                                call.argument("audioLoadConfiguration"),
+                                rawAudioEffects,
+                                call.argument("androidAudioOffloadPreferences"),
+                                call.argument("androidOffloadSchedulingEnabled"),
+                                call.argument("useLazyPreparation")));
+                result.success(null);
                 break;
             }
-            List<Object> rawAudioEffects = call.argument("androidAudioEffects");
-            players.put(
-                id,
-                new AudioPlayer(
-                    applicationContext,
-                    messenger,
-                    id,
-                    call.argument("audioLoadConfiguration"),
-                    rawAudioEffects,
-                    call.argument("androidAudioOffloadPreferences"),
-                    call.argument("androidOffloadSchedulingEnabled"),
-		    call.argument("useLazyPreparation")
-                )
-            );
-            result.success(null);
-            break;
-        }
-        case "disposePlayer": {
-            String id = call.argument("id");
-            AudioPlayer player = players.get(id);
-            if (player != null) {
-                player.dispose();
-                players.remove(id);
+            case "disposePlayer": {
+                String id = call.argument("id");
+                AudioPlayer player = players.get(id);
+                if (player != null) {
+                    player.dispose();
+                    players.remove(id);
+                }
+                result.success(new HashMap<String, Object>());
+                break;
             }
-            result.success(new HashMap<String, Object>());
-            break;
-        }
-        case "disposeAllPlayers": {
-            dispose();
-            result.success(new HashMap<String, Object>());
-            break;
-        }
-        case "startRecord": {
-            AudioPlayer player = resolvePlayerForPcmRecord(call.argument("id"), result);
-            if (player != null) {
-                player.startPcmRecording((String) call.argument("path"), result);
+            case "disposeAllPlayers": {
+                dispose();
+                result.success(new HashMap<String, Object>());
+                break;
             }
-            break;
-        }
-        case "stopRecord": {
-            AudioPlayer player = resolvePlayerForPcmRecord(call.argument("id"), result);
-            if (player != null) {
-                player.stopPcmRecording(result);
+            case "startRecord": {
+                AudioPlayer player = resolvePlayerForPcmRecord(call.argument("id"), result);
+                if (player != null) {
+                    player.startPcmRecording((String) call.argument("fileName"), result);
+                }
+                break;
             }
-            break;
-        }
-        default:
-            result.notImplemented();
-            break;
+            case "stopRecord": {
+                AudioPlayer player = resolvePlayerForPcmRecord(call.argument("id"), result);
+                if (player != null) {
+                    player.stopPcmRecording(result);
+                }
+                break;
+            }
+            default:
+                result.notImplemented();
+                break;
         }
     }
 
     /**
-     * If [id] is non-null, that player is used. If null and exactly one player exists, use it
+     * If [id] is non-null, that player is used. If null and exactly one player
+     * exists, use it
      * (typical single-player app). Otherwise reports an error.
      */
     private AudioPlayer resolvePlayerForPcmRecord(String id, Result result) {
